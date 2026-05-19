@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MediaPipe Live Detector - Ultra Light</title>
+  <script type="module">
+    import {
+      FaceLandmarker, HandLandmarker, PoseLandmarker,
+      FilesetResolver, DrawingUtils
+    } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+    const state = { face: false, hand: false, pose: false };
+    let faceLandmarker=null, handLandmarker=null, poseLandmarker=null, drawingUtils=null;
+    let stream=null, animId=null, lastTime=-1, running=false;
+
+    const video    = document.getElementById("video");
+    const canvas   = document.getElementById("canvas");
+    const ctx      = canvas.getContext("2d");
+    const startBtn = document.getElementById("startBtn");
+    const statusEl = document.getElementById("status");
+
+    // 1. HIDDEN DOWNSAMPLE BUFFER FOR AI
+    const aiCanvas = document.createElement("canvas");
+    const aiCtx = aiCanvas.getContext("2d");
+    const AI_PROCESSING_WIDTH = 320; // Drastically reduces memory bandwidth
+
+    const perf = {
+      face: { latency: 0, fps: 0, _frames: 0, _lastSec: 0 },
+      hand: { latency: 0, fps: 0, _frames: 0, _lastSec: 0 },
+      pose: { latency: 0, fps: 0, _frames: 0, _lastSec: 0 },
+    };
+
+    let gFrames=0, gLastSec=performance.now();
+    let frameCounter = 0;
+    let visionReady = false;
+
+    // Cache results so rendering doesn't flicker during interleaved frames
+    let lastFaceResult = null;
+    let lastHandResult = null;
+    let lastPoseResult = null;
+
+    async function loadModels() {
+      setStatus("Loading ultra-light MediaPipe models…");
+      const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+      );
+      
+      // TWEAKED: Tracking confidence lowered to 0.2 to prevent heavy re-detections
+      [faceLandmarker, handLandmarker, poseLandmarker] = await Promise.all([
+        FaceLandmarker.createFromOptions(vision, {
+          baseOptions:{ modelAssetPath:"https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task", delegate:"GPU" },
+          runningMode:"VIDEO", numFaces:1,
+          minFaceDetectionConfidence:0.4, minFacePresenceConfidence:0.4, minTrackingConfidence:0.2
+        }),
+        HandLandmarker.createFromOptions(vision, {
+          baseOptions:{ modelAssetPath:"https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task", delegate:"GPU" },
+          runningMode:"VIDEO", numHands:1,
+          minHandDetectionConfidence:0.4, minHandPresenceConfidence:0.4, minTrackingConfidence:0.2
+        }),
+        PoseLandmarker.createFromOptions(vision, {
+          baseOptions:{ modelAssetPath:"https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task", delegate:"GPU" },
+          runningMode:"VIDEO", numPoses:1,
+          minPoseDetectionConfidence:0.4, minPosePresenceConfidence:0.4, minTrackingConfidence:0.2
+        })
+      ]);
+      
+      drawingUtils = new DrawingUtils(ctx);
+      visionReady  = true;
+      setStatus("Models live. Toggle tracks and hit Start Camera.");
+      startBtn.disabled = false;
+    }
+
+    async function startCamera() {
+      if(running) return;
+      try {
+        // Request High-Def for visual quality
+        stream = await navigator.mediaDevices.getUserMedia({
+          video:{ facingMode:"user", width:{ideal:1280}, height:{ideal:720}, frameRate:{ideal:60} }, audio:false
+        });
+        video.srcObject = stream;
+        await video.play();
+        
+        // Match main canvas to HD video
+        canvas.width  = video.videoWidth;
+        canvas.height = video.videoHeight;
+
+        // Set downsampled buffer maintaining aspect ratio
+        aiCanvas.width = AI_PROCESSING_WIDTH;
+        aiCanvas.height = Math.floor(AI_PROCESSING_WIDTH * (video.videoHeight / video.videoWidth));
+        
+        running = true;
+        startBtn.textContent = "⏹ Stop Camera";
+        startBtn.classList.add("active");
+        document.getElementById("stage-overlay").style.display = "none";
+        setStatus("Processing framework active. HD Render + SD Backend.");
+        
+        const now = performance.now();
+        for(const k of ["face","hand","pose"]){ perf[k]._frames=0; perf[k]._lastSec=now; }
+        gFrames=0; gLastSec=now;
+        
+        loop();
+      } catch(e) {
+        setStatus("Camera Access Error: " + e.message);
+      }
+    }
+
+    function stopCamera(){
+      running=false; 
+      cancelAnimationFrame(animId);
+      stream?.getTracks().forEach(t=>t.stop());
+      video.srcObject=null;
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+      startBtn.textContent="▶ Start Camera";
+      startBtn.classList.remove("active");
+      document.getElementById("stage-overlay").style.display = "flex";
+      setStatus("Execution paused.");
+    }
+
+    async function loop(){
+      if(!running) return;
+      if(video.readyState < 2){ animId=requestAnimationFrame(loop); return; }
+      
+      const now = performance.now();
+      if(now === lastTime){ animId=requestAnimationFrame(loop); return; }
+      lastTime = now;
+
+      gFrames++;
+      frameCounter++;
+      if(now - gLastSec > 1000){
+        document.getElementById("fps-global").textContent = gFrames;
+        gFrames=0; gLastSec=now;
+      }
+
+      // --- DOWNSAMPLE FOR BACKEND INFERENCE ---
+      // Draw HD video into tiny buffer for ultra-fast GPU upload
+      aiCtx.drawImage(video, 0, 0, aiCanvas.width, aiCanvas.height);
+
+      // --- INTERLEAVED INFERENCE (Round Robin) ---
+      // We only process one model per frame to guarantee 60 FPS UI
+      if(state.face && frameCounter % 3 === 0){
+        const t0 = performance.now();
+        lastFaceResult = faceLandmarker.detectForVideo(aiCanvas, now);
+        updatePerf("face", performance.now() - t0, now);
+      } else if (!state.face) { lastFaceResult = null; zeroPerf("face"); }
+
+      if(state.hand && frameCounter % 3 === 1){
+        const t0 = performance.now();
+        lastHandResult = handLandmarker.detectForVideo(aiCanvas, now);
+        updatePerf("hand", performance.now() - t0, now);
+      } else if (!state.hand) { lastHandResult = null; zeroPerf("hand"); }
+
+      if(state.pose && frameCounter % 3 === 2){
+        const t0 = performance.now();
+        lastPoseResult = poseLandmarker.detectForVideo(aiCanvas, now);
+        updatePerf("pose", performance.now() - t0, now);
+      } else if (!state.pose) { lastPoseResult = null; zeroPerf("pose"); }
+
+
+      // --- HD RENDERING PIPELINE ---
+      ctx.save();
+      // Native Canvas H-Flip
+      ctx.translate(canvas.width, 0);
+      ctx.scale(-1, 1);
+      
+      // Draw HD video
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+      // 1. Draw Cached Face (TESSELATION REMOVED)
+      if(state.face && lastFaceResult){
+        for(const lm of lastFaceResult.faceLandmarks){
+          // Tesselation is omitted entirely to save CPU moveTo/lineTo operations
+          drawingUtils.drawConnectors(lm, FaceLandmarker.FACE_LANDMARKS_RIGHT_EYE,     { color:"#34d399", lineWidth:1.5 });
+          drawingUtils.drawConnectors(lm, FaceLandmarker.FACE_LANDMARKS_LEFT_EYE,      { color:"#34d399", lineWidth:1.5 });
+          drawingUtils.drawConnectors(lm, FaceLandmarker.FACE_LANDMARKS_FACE_OVAL,     { color:"#4ade80", lineWidth:1.5 });
+          drawingUtils.drawConnectors(lm, FaceLandmarker.FACE_LANDMARKS_LIPS,          { color:"#f87171", lineWidth:1.5 });
+        }
+      }
+
+      // 2. Draw Cached Hand
+      let handToLabel = null;
+      if(state.hand && lastHandResult){
+        for(let i=0; i<lastHandResult.landmarks.length; i++){
+          const rawSide = lastHandResult.handedness[i]?.[0]?.categoryName;
+          const userSide = (rawSide === "Left") ? "Right" : "Left";
+          const color    = (userSide === "Right") ? "#60a5fa" : "#f472b6";
+          
+          drawingUtils.drawConnectors(lastHandResult.landmarks[i], HandLandmarker.HAND_CONNECTIONS, { color, lineWidth:2.5 });
+          drawingUtils.drawLandmarks(lastHandResult.landmarks[i], { color, fillColor:"#fff", radius:3 });
+          
+          if(lastHandResult.landmarks[i][0]) {
+            handToLabel = { pt: lastHandResult.landmarks[i][0], text: userSide + " Hand", color };
+          }
+        }
+      }
+
+      // 3. Draw Cached Pose
+      if(state.pose && lastPoseResult){
+        for(const lm of lastPoseResult.landmarks){
+          drawingUtils.drawConnectors(lm, PoseLandmarker.POSE_CONNECTIONS, { color:"#fb923c40", lineWidth:2.5 });
+          drawingUtils.drawLandmarks(lm, { color:"#fb923c", fillColor:"#fff", radius:3.5 });
+        }
+      }
+
+      ctx.restore();
+
+      // Render non-flipped text
+      if(handToLabel) {
+        ctx.fillStyle = handToLabel.color;
+        ctx.font = "bold 16px Inter, sans-serif";
+        const targetX = (1 - handToLabel.pt.x) * canvas.width;
+        ctx.fillText(handToLabel.text, targetX, (handToLabel.pt.y * canvas.height) - 15);
+      }
+
+      animId = requestAnimationFrame(loop);
+    }
+
+    function updatePerf(key, dtMs, now){
+      const p = perf[key];
+      p.latency = dtMs;
+      p._frames++;
+      if(now - p._lastSec > 1000){
+        p.fps = p._frames;
+        p._frames = 0;
+        p._lastSec = now;
+      }
+      document.getElementById(`lat-${key}`).textContent = dtMs.toFixed(1) + " ms";
+      
+      // Multiply by 3 because we only sample this specific detector every 3rd frame
+      document.getElementById(`fps-${key}`).textContent = (p.fps * 3); 
+    }
+
+    function zeroPerf(key){
+      document.getElementById(`lat-${key}`).textContent = "— ms";
+      document.getElementById(`fps-${key}`).textContent = "—";
+    }
+
+    document.querySelectorAll(".toggle-btn").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const key = btn.dataset.key;
+        state[key] = !state[key];
+        btn.classList.toggle("on", state[key]);
+        btn.querySelector(".dot").style.transform = state[key] ? "translateX(24px)" : "";
+        if(!state[key]) zeroPerf(key);
+      });
+    });
+
+    startBtn.addEventListener("click", async () => {
+      if(!visionReady) return;
+      if(!running) await startCamera(); else stopCamera();
+    });
+
+    function setStatus(msg){ statusEl.textContent = msg; }
+    loadModels().catch(e => setStatus("Initialization Error: " + e.message));
+  </script>
+
+  <style>
+    :root{
+      --bg:#0f1117; --surface:#1a1d27; --surface2:#22263a;
+      --border:#2e3350; --text:#e2e8f0; --muted:#64748b;
+      --face:#34d399; --hand:#60a5fa; --pose:#fb923c;
+      --radius:.75rem; --trans:180ms cubic-bezier(.16,1,.3,1);
+    }
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    html,body{height:100%}
+    body{
+      font-family:Inter,system-ui,sans-serif;
+      background:var(--bg);color:var(--text);
+      display:flex;flex-direction:column;align-items:center;
+      min-height:100dvh;padding:1rem;gap:.85rem;
+    }
+
+    header{width:100%;max-width:720px;display:flex;align-items:center;gap:.75rem}
+    .logo{width:34px;height:34px;flex-shrink:0}
+    header h1{font-size:1.05rem;font-weight:700;letter-spacing:-.01em}
+    header p{font-size:.75rem;color:var(--muted)}
+
+    .card{width:100%;max-width:720px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:.9rem 1.15rem}
+    .controls-row{display:flex;flex-wrap:wrap;gap:.65rem;align-items:center}
+
+    .toggle-btn{display:flex;align-items:center;gap:.55rem;background:var(--surface2);border:1px solid var(--border);border-radius:2rem;padding:.4rem .8rem .4rem .5rem;cursor:pointer;color:var(--muted);font-size:.8rem;font-weight:500;transition:color var(--trans),border-color var(--trans);user-select:none}
+    .toggle-btn .track{width:40px;height:20px;background:var(--border);border-radius:999px;position:relative;flex-shrink:0;transition:background var(--trans)}
+    .toggle-btn .dot{position:absolute;top:3px;left:3px;width:14px;height:14px;border-radius:50%;background:#fff;transition:transform var(--trans)}
+    .toggle-btn.on{color:var(--text)}
+    .toggle-btn[data-key="face"].on{border-color:var(--face)}.toggle-btn[data-key="face"].on .track{background:var(--face)}
+    .toggle-btn[data-key="hand"].on{border-color:var(--hand)}.toggle-btn[data-key="hand"].on .track{background:var(--hand)}
+    .toggle-btn[data-key="pose"].on{border-color:var(--pose)}.toggle-btn[data-key="pose"].on .track{background:var(--pose)}
+
+    #startBtn{margin-left:auto;background:#22c55e;color:#0f1117;border:none;border-radius:2rem;padding:.45rem 1.1rem;font-size:.82rem;font-weight:700;cursor:pointer;transition:background var(--trans),opacity var(--trans)}
+    #startBtn:disabled{opacity:.4;cursor:not-allowed}
+    #startBtn.active{background:#ef4444;color:#fff}
+
+    .perf-bar{width:100%;max-width:720px;display:grid;grid-template-columns:repeat(4,1fr);gap:.5rem;}
+    .perf-card{background:var(--surface);border:1px solid var(--border);border-radius:.6rem;padding:.6rem .75rem}
+    .perf-card .label{font-size:.68rem;color:var(--muted);text-transform:uppercase;margin-bottom:.3rem}
+    .perf-card .row{display:flex;justify-content:space-between;align-items:baseline;font-size:.78rem}
+    .perf-card .row .k{color:var(--muted);font-size:.7rem}
+    .perf-card .row .v{font-weight:700;font-size:.85rem}
+    .perf-card[data-det="face"] .v{color:var(--face)}
+    .perf-card[data-det="hand"] .v{color:var(--hand)}
+    .perf-card[data-det="pose"] .v{color:var(--pose)}
+    .perf-card[data-det="global"] .v{color:#a78bfa}
+
+    .status-bar{width:100%;max-width:720px;font-size:.73rem;color:var(--muted);padding:0 .2rem}
+
+    .stage{width:100%;max-width:720px;position:relative;background:#000;border-radius:var(--radius);overflow:hidden;border:1px solid var(--border);aspect-ratio:16/9;}
+    #video{position:absolute;width:1px;height:1px;opacity:0;pointer-events:none}
+    #canvas{width:100%;height:100%;display:block;object-fit:cover}
+    .stage-overlay{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:.5rem;color:var(--muted);font-size:.85rem;pointer-events:none;background:#111420}
+
+    .legend{display:flex;gap:1rem;flex-wrap:wrap;font-size:.72rem;color:var(--muted);justify-content:center}
+    .legend span{display:flex;align-items:center;gap:.3rem}
+    .legend .dot{width:7px;height:7px;border-radius:50%}
+
+    @media(max-width:520px){
+      .perf-bar{grid-template-columns:repeat(2,1fr)}
+      .controls-row{flex-direction:column;align-items:flex-start}
+      #startBtn{margin-left:0;width:100%}
+    }
+  </style>
+</head>
+<body>
+
+  <header>
+    <svg class="logo" viewBox="0 0 36 36" fill="none">
+      <rect width="36" height="36" rx="10" fill="#22263a"/>
+      <circle cx="18" cy="13" r="5" stroke="#34d399" stroke-width="2"/>
+      <circle cx="12" cy="23" r="3" stroke="#60a5fa" stroke-width="1.8"/>
+      <circle cx="24" cy="23" r="3" stroke="#fb923c" stroke-width="1.8"/>
+      <line x1="18" y1="18" x2="12" y2="23" stroke="#64748b" stroke-width="1"/>
+      <line x1="18" y1="18" x2="24" y2="23" stroke="#64748b" stroke-width="1"/>
+    </svg>
+    <div>
+      <h1>MediaPipe Live Detector</h1>
+      <p>HD Display + Downsampled Backend Interleaving</p>
+    </div>
+  </header>
+
+  <div class="card">
+    <div class="controls-row">
+      <button class="toggle-btn" data-key="face">
+        <span class="track"><span class="dot"></span></span>
+        <span>😊 Face</span>
+      </button>
+      <button class="toggle-btn" data-key="hand">
+        <span class="track"><span class="dot"></span></span>
+        <span>✋ Hand</span>
+      </button>
+      <button class="toggle-btn" data-key="pose">
+        <span class="track"><span class="dot"></span></span>
+        <span>🧍 Pose</span>
+      </button>
+      <button id="startBtn" disabled>▶ Start Camera</button>
+    </div>
+  </div>
+
+  <div class="perf-bar">
+    <div class="perf-card" data-det="global">
+      <div class="label">Overall</div>
+      <div class="row"><span class="k">Render FPS</span><span class="v" id="fps-global">—</span></div>
+    </div>
+    <div class="perf-card" data-det="face">
+      <div class="label">😊 Face</div>
+      <div class="row"><span class="k">Est. FPS</span><span class="v" id="fps-face">—</span></div>
+      <div class="row"><span class="k">Latency</span><span class="v" id="lat-face">— ms</span></div>
+    </div>
+    <div class="perf-card" data-det="hand">
+      <div class="label">✋ Hand</div>
+      <div class="row"><span class="k">Est. FPS</span><span class="v" id="fps-hand">—</span></div>
+      <div class="row"><span class="k">Latency</span><span class="v" id="lat-hand">— ms</span></div>
+    </div>
+    <div class="perf-card" data-det="pose">
+      <div class="label">🧍 Pose</div>
+      <div class="row"><span class="k">Est. FPS</span><span class="v" id="fps-pose">—</span></div>
+      <div class="row"><span class="k">Lat</span><span class="v" id="lat-pose">— ms</span></div>
+    </div>
+  </div>
+
+  <div class="status-bar" id="status">Initializing modules…</div>
+
+  <div class="stage">
+    <video id="video" playsinline muted></video>
+    <canvas id="canvas"></canvas>
+    <div class="stage-overlay" id="stage-overlay">
+      <svg width="44" height="44" viewBox="0 0 48 48" fill="none">
+        <circle cx="24" cy="18" r="9" stroke="#e2e8f0" stroke-width="2"/>
+        <path d="M8 42c0-8.837 7.163-16 16-16s16 7.163 16 16" stroke="#e2e8f0" stroke-width="2" stroke-linecap="round"/>
+      </svg>
+      <span>Hardware initialization clear. Start camera feed.</span>
+    </div>
+  </div>
+
+  <div class="legend">
+    <span><span class="dot" style="background:#34d399"></span>Face mesh</span>
+    <span><span class="dot" style="background:#60a5fa"></span>Right hand</span>
+    <span><span class="dot" style="background:#f472b6"></span>Left hand</span>
+    <span><span class="dot" style="background:#fb923c"></span>Pose skeleton</span>
+  </div>
+
+</body>
+</html>
